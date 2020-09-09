@@ -13,13 +13,14 @@ import wordcloud as wc
 from dask.diagnostics import ProgressBar
 from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, KFold, train_test_split, learning_curve
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import LabelEncoder, PolynomialFeatures
 from sklearn.metrics import make_scorer, classification_report, confusion_matrix, accuracy_score, r2_score
 from sklearn.metrics import roc_curve, roc_auc_score, average_precision_score, confusion_matrix, precision_recall_curve
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_selection import SelectKBest, chi2, f_classif, f_regression, mutual_info_classif, mutual_info_regression
+from sklearn.linear_model import SGDRegressor
 
 import nltk
 from nltk.corpus import stopwords, wordnet
@@ -312,29 +313,29 @@ def optimization_random_search(model, X_train, y_train, is_regression=False):
     # Define workflow
     pipeline = Pipeline([
         ('tf-idf', TfidfVectorizer()), 
-        #('trunc-svd', TruncatedSVD()),
+        ('trunc-svd', TruncatedSVD()),
         ('select-k', SelectKBest()), 
         ('estimator', model)
     ])
     
     # Define Hyperparamter space
-    score_funcs = [f_regression] if is_regression else [f_classif, chi2]
-    criterions = ['mse', 'mae'] if is_regression else ['entropy', 'gini']
+    score_funcs = [f_regression] if is_regression else [f_classif]
+    criterions = ['mse'] if is_regression else ['entropy']
 
     hparams = [{
-                'tf-idf__min_df': np.arange(15, 16),                     # ignore terms that have a document frequency strictly lower than the given threshold
-                #'trunc-svd__n_components': [50],                       # desired dimensionality of output data
-                #'trunc-svd__n_iter': [3],                              # number of iterations for randomized SVD solver
+                'tf-idf__min_df': np.arange(3, 7),                 # ignore terms that have a document frequency strictly lower than the given threshold
+                'trunc-svd__n_components': np.arange(50, 70),       # desired dimensionality of output data
+                'trunc-svd__n_iter': np.arange(3, 7),              # number of iterations for randomized SVD solver
                 'select-k__score_func': score_funcs,                    # scoring function for feature selection
-                'select-k__k': np.arange(25, 26),                       # number of feature to select with best score
-                'estimator__n_estimators': np.arange(2, 3),          # the number of trees in the forest
+                'select-k__k': np.arange(25, 50),                       # number of feature to select with best score
+                'estimator__n_estimators': np.arange(100, 250),          # the number of trees in the forest
                 'estimator__criterion': criterions,                     # the function to measure the quality of a split
-                'estimator__max_depth': np.arange(3, 5),               # the maximum depth of the tree
-                'estimator__min_samples_split': np.arange(60, 61),      # the minimum number of samples required to split an internal node
-                'estimator__min_samples_leaf': np.arange(15, 16),        # the minimum number of samples required to be at a leaf node
+                'estimator__max_depth': np.arange(50, 150),               # the maximum depth of the tree
+                'estimator__min_samples_split': np.arange(15, 550),      # the minimum number of samples required to split an internal node
+                'estimator__min_samples_leaf': np.arange(15, 550),        # the minimum number of samples required to be at a leaf node
                 'estimator__max_features': ['sqrt', 'log2'],      # the number of features to consider when looking for the best split
                 'estimator__bootstrap': [True],                  # whether bootstrap samples are used when building trees, if False, the whole dataset is used to build each tree
-                'estimator__max_samples': stats.uniform(0.6, 0.4),        # if bootstrap is True, the number of samples to draw from X to train each base estimator
+                'estimator__max_samples': stats.uniform(0.7, 0.25),        # if bootstrap is True, the number of samples to draw from X to train each base estimator
                 'estimator__n_jobs': [-1]                               # the number of jobs to run in parallel
     }]
 
@@ -365,7 +366,7 @@ def optimization_random_search(model, X_train, y_train, is_regression=False):
         estimator=pipeline, 
         param_distributions=hparams, 
         scoring=metrics,
-        n_iter=1,
+        n_iter=3,
         refit=refit_metric,
         cv=cross_validation,                                            # for every hparam combination it will shuffle data with same key, random_state
         return_train_score=True,                                        # used to get insights on how different parameter settings impact the overfitting/underfitting trade-off
@@ -443,9 +444,26 @@ def predict_score(load_model=False, load_clean_data=True, sample=False, info=Tru
         with open('data/output/model_score.pkl', 'rb') as file:
             estimator = pickle.load(file)
     else:
+        # Create new features using non-linear method 'polynomial'
+        poly_features = PolynomialFeatures(degree=3)
+
+        # Model
+        model = SGDRegressor()
+
+        estimator = make_pipeline(TfidfVectorizer(min_df=20), SelectKBest(k=300), poly_features, model)
+        estimator.fit(X_train, y_train)
+
+        # Save model
+        model_name = 'model_score.pkl'
+        with open('data/output/' + model_name, 'wb') as file:
+            pickle.dump(estimator, file)
+
+        # Visualize the Pipeline process
+        visualize_pipeline(estimator, 'estimator_score')
+
         # Find best estimator
-        model = RandomForestRegressor(n_jobs=-1)
-        estimator = optimization_random_search(model, X_train, y_train, is_regression=True)
+        #model = RandomForestRegressor(n_jobs=-1)
+        #estimator = optimization_random_search(model, X_train, y_train, is_regression=True)
 
     # Prediction
     scores_train = estimator.score(X_train, y_train)
@@ -455,11 +473,11 @@ def predict_score(load_model=False, load_clean_data=True, sample=False, info=Tru
     print('Random forest regressor on test dataset:\t {:.4f}\n'.format(scores_test))
 
     # Visualization
-    #plot_learning(estimator, X_train, y_train, is_regression=True)
+    #plot_learning(estimator, X_train, y_train, n_iter=5, is_regression=True)
 
     return
 
-def plot_learning(model, X_train, y_train, is_regression=False):
+def plot_learning(model, X_train, y_train, n_iter=5, is_regression=False):
     """
     A learning curve shows the validation and training score of an estimator for varying numbers of training samples.
     It is a tool to find out how much we benefit from adding more training data 
@@ -474,7 +492,7 @@ def plot_learning(model, X_train, y_train, is_regression=False):
         model, 
         X_train, 
         y_train, 
-        train_sizes=np.linspace(0.1, 1.0, 5), 
+        train_sizes=np.linspace(0.1, 1.0, n_iter), 
         scoring=metric, 
         cv=3,
         n_jobs=-1,
@@ -556,7 +574,7 @@ def sentiment_analysis(load_model=False, load_clean_data=True, sample=False, inf
     # Visualization
     visualization_classification(y_test, y_preds)
 
-    #plot_learning(estimator, X_train, y_train, is_regression=False)
+    #plot_learning(estimator, X_train, y_train, n_iter=5, is_regression=False)
 
     return
 
@@ -644,7 +662,7 @@ def visualization_classification(y_test, y_preds):
 
 if __name__ == "__main__":
 
-    load_model = False
+    load_model = True
 
     predict_score(load_model=load_model, load_clean_data=True, sample=False, info=False)
 
