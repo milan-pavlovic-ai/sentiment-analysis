@@ -11,12 +11,12 @@ import scipy.stats as stats
 import wordcloud as wc
 
 from dask.diagnostics import ProgressBar
-from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, KFold, train_test_split
+from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold, KFold, train_test_split, learning_curve
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import make_scorer, classification_report, confusion_matrix, accuracy_score, r2_score
-from sklearn.metrics import plot_confusion_matrix, plot_precision_recall_curve, plot_roc_curve
+from sklearn.metrics import roc_curve, roc_auc_score, average_precision_score, confusion_matrix, precision_recall_curve
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_selection import SelectKBest, chi2, f_classif, f_regression, mutual_info_classif, mutual_info_regression
@@ -318,23 +318,23 @@ def optimization_random_search(model, X_train, y_train, is_regression=False):
     ])
     
     # Define Hyperparamter space
-    score_funcs = [f_regression, mutual_info_regression] if is_regression else [f_classif, mutual_info_classif, chi2]
+    score_funcs = [f_regression] if is_regression else [f_classif, chi2]
     criterions = ['mse', 'mae'] if is_regression else ['entropy', 'gini']
 
     hparams = [{
-                'tf-idf__min_df': np.arange(15, 20),                     # ignore terms that have a document frequency strictly lower than the given threshold
+                'tf-idf__min_df': np.arange(15, 16),                     # ignore terms that have a document frequency strictly lower than the given threshold
                 #'trunc-svd__n_components': [50],                       # desired dimensionality of output data
                 #'trunc-svd__n_iter': [3],                              # number of iterations for randomized SVD solver
                 'select-k__score_func': score_funcs,                    # scoring function for feature selection
-                'select-k__k': np.arange(10, 50),                       # number of feature to select with best score
+                'select-k__k': np.arange(25, 26),                       # number of feature to select with best score
                 'estimator__n_estimators': np.arange(2, 3),          # the number of trees in the forest
                 'estimator__criterion': criterions,                     # the function to measure the quality of a split
                 'estimator__max_depth': np.arange(3, 5),               # the maximum depth of the tree
-                'estimator__min_samples_split': np.arange(5, 100),      # the minimum number of samples required to split an internal node
-                'estimator__min_samples_leaf': np.arange(5, 50),        # the minimum number of samples required to be at a leaf node
-                'estimator__max_features': ['sqrt', 'log2', None],      # the number of features to consider when looking for the best split
-                'estimator__bootstrap': [True, False],                  # whether bootstrap samples are used when building trees, if False, the whole dataset is used to build each tree
-                'estimator__max_samples': stats.uniform(0, 1),          # if bootstrap is True, the number of samples to draw from X to train each base estimator
+                'estimator__min_samples_split': np.arange(60, 61),      # the minimum number of samples required to split an internal node
+                'estimator__min_samples_leaf': np.arange(15, 16),        # the minimum number of samples required to be at a leaf node
+                'estimator__max_features': ['sqrt', 'log2'],      # the number of features to consider when looking for the best split
+                'estimator__bootstrap': [True],                  # whether bootstrap samples are used when building trees, if False, the whole dataset is used to build each tree
+                'estimator__max_samples': stats.uniform(0.6, 0.4),        # if bootstrap is True, the number of samples to draw from X to train each base estimator
                 'estimator__n_jobs': [-1]                               # the number of jobs to run in parallel
     }]
 
@@ -406,7 +406,7 @@ def optimization_random_search(model, X_train, y_train, is_regression=False):
     # Save model
     model_name = 'model_score.pkl' if is_regression else 'model_sentiment.pkl'
     with open('data/output/' + model_name, 'wb') as file:
-        pickle.dump(model, file)
+        pickle.dump(rand_search, file)
 
     # Visualize the Pipeline process
     visualize_pipeline(pipeline, 'estimator_by_grid')
@@ -434,26 +434,93 @@ def predict_score(load_model=False, load_clean_data=True, sample=False, info=Tru
     """
     Predict score from text review
     """
+    # Load and split data
+    data, X_data, y_data = load_data_predict_score('data/reviews/Hotel_Reviews.csv', load_clean_data=load_clean_data, sample=sample, info=info)
+    X_train, X_test, y_train, y_test = train_test_split(X_data, y_data, test_size=0.1, random_state=0)
+
     # Load saved model
     if load_model:
         with open('data/output/model_score.pkl', 'rb') as file:
             estimator = pickle.load(file)
     else:
-        # Load and split data
-        data, X_data, y_data = load_data_predict_score('data/reviews/Hotel_Reviews.csv', load_clean_data=load_clean_data, sample=sample, info=info)
-        X_train, X_test, y_train, y_test = train_test_split(X_data, y_data, test_size=0.1, random_state=0)
-
         # Find best estimator
-        model = RandomForestRegressor()
+        model = RandomForestRegressor(n_jobs=-1)
         estimator = optimization_random_search(model, X_train, y_train, is_regression=True)
 
     # Prediction
     scores_train = estimator.score(X_train, y_train)
-    print('Random forest regressor on training dataset:\t', scores_train)
+    print('Random forest regressor on train dataset:\t {:.4f}'.format(scores_train))
 
     scores_test = estimator.score(X_test, y_test)
-    print('Random forest regressor on test dataset:\t', scores_test)
+    print('Random forest regressor on test dataset:\t {:.4f}\n'.format(scores_test))
 
+    # Visualization
+    #plot_learning(estimator, X_train, y_train, is_regression=True)
+
+    return
+
+def plot_learning(model, X_train, y_train, is_regression=False):
+    """
+    A learning curve shows the validation and training score of an estimator for varying numbers of training samples.
+    It is a tool to find out how much we benefit from adding more training data 
+        and whether the estimator suffers more from a variance error or a bias error.
+    fit_time
+        The time for fitting the estimator on the train set for each cv split.
+
+    Source: https://scikit-learn.org/stable/modules/learning_curve.html
+    """
+    metric = 'accuracy' if not is_regression else 'r2_score'
+    train_sizes, train_scores, val_scores, fit_times, _ = learning_curve(
+        model, 
+        X_train, 
+        y_train, 
+        train_sizes=np.linspace(0.1, 1.0, 5), 
+        scoring=metric, 
+        cv=3,
+        n_jobs=-1,
+        return_times=True)
+    
+    train_scores_mean = np.mean(train_scores, axis=1)
+    train_scores_std = np.std(train_scores, axis=1)
+
+    val_scores_mean = np.mean(val_scores, axis=1)
+    val_scores_std = np.std(val_scores, axis=1)
+
+    fit_times_mean = np.mean(fit_times, axis=1)
+    fit_times_std = np.std(fit_times, axis=1)
+
+    # Plot learning curve
+    plt.figure()
+    plt.title('Learning Curve')
+    plt.xlabel('Training examples')
+    plt.ylabel(metric)
+    plt.ylim(0.0, 1.1)
+
+    plt.plot(train_sizes, train_scores_mean, 'o-', color='r', label='Training score')
+    plt.fill_between(train_sizes, train_scores_mean - train_scores_std, train_scores_mean + train_scores_std, color='r', alpha=0.1)
+
+    plt.plot(train_sizes, val_scores_mean, 'o-', color='g', label='Cross-validation score')
+    plt.fill_between(train_sizes, val_scores_mean - val_scores_std, val_scores_mean + val_scores_std, color='g', alpha=0.1)
+    plt.legend(loc='best')
+
+    # Plot n_samples vs fit_times
+    plt.figure()
+    plt.title('Scalability of the model')
+    plt.xlabel('Training examples')
+    plt.ylabel('Fit times')
+    plt.plot(train_sizes, fit_times_mean, 'o-')
+    plt.fill_between(train_sizes, fit_times_mean - fit_times_std, fit_times_mean + fit_times_std, alpha=0.1)
+
+    # Plot fit_time vs score
+    plt.figure()
+    plt.title('Performance of the model')
+    plt.xlabel('Fit times')
+    plt.ylabel(metric)
+    plt.plot(fit_times_mean, val_scores_mean, 'o-')
+    plt.fill_between(fit_times_mean, val_scores_mean - val_scores_std, val_scores_mean + val_scores_std, alpha=0.1)
+
+    plt.show()
+    plt.close()
     return
 
 
@@ -463,50 +530,124 @@ def sentiment_analysis(load_model=False, load_clean_data=True, sample=False, inf
     """
     Predict sentiment from text review
     """
+    # Load and split data
+    data, X_data, y_data = load_data_sentiment_analysis('data/reviews/Hotel_Reviews.csv', load_clean_data=load_clean_data, sample=sample, info=info)
+    X_train, X_test, y_train, y_test = train_test_split(X_data, y_data, test_size=0.1, stratify=y_data, random_state=0)
+
     # Load saved model
     if load_model:
         with open('data/output/model_sentiment.pkl', 'rb') as file:
             estimator = pickle.load(file)
     else:
-        # Load and split data
-        data, X_data, y_data = load_data_sentiment_analysis('data/reviews/Hotel_Reviews.csv', load_clean_data=load_clean_data, sample=sample, info=info)
-        X_train, X_test, y_train, y_test = train_test_split(X_data, y_data, test_size=0.1, stratify=y_data, random_state=0)
-
         # Find best estimator
-        model = RandomForestClassifier()
+        model = RandomForestClassifier(n_jobs=-1)
         estimator = optimization_random_search(model, X_train, y_train, is_regression=False)
 
     # Prediction
     scores_train = estimator.score(X_train, y_train)
-    print('Random forest classifier on training dataset:', scores_train)
+    print('Random forest classifier on train dataset:\t {:.4f}'.format(scores_train))
 
     scores_test = estimator.score(X_test, y_test)
-    print('Random forest classifier on test dataset:', scores_test)
+    print('Random forest classifier on test dataset:\t {:.4f}\n'.format(scores_test))
     
     y_preds = estimator.predict(X_test)
     print(classification_report(y_test, y_preds), '\n')
 
     # Visualization
-    conf_matrix = plot_confusion_matrix(estimator, X_test, y_test)
-    conf_matrix.ax_.set_title('Confusion matrix')
+    visualization_classification(y_test, y_preds)
 
-    roc_chart = plot_roc_curve(estimator, X_test, y_test)
-    roc_chart.ax_.set_title('ROC chart')
-
-    pr_chart = plot_precision_recall_curve(estimator, X_test, y_test)
-    pr_chart.ax_.set_title('Precision-Recall chart')
-
-    plt.show()
-    plt.close()
+    #plot_learning(estimator, X_train, y_train, is_regression=False)
 
     return
 
+def plot_roc_curve(y_test, y_scores, label='scores'):
+    """
+    ROC CURVE 
+        It will also change the number of FPR and TRP by changing the treshold (all similar like precision-recall curve)
+        One treshold value correspond to one FPR and TRP value, except some treshold can be removed because they are not relevant for plotting the curve
+        Source: https://scikit-learn.org/stable/auto_examples/model_selection/plot_roc.html
+    """
+    fpr, tpr, thresholds = roc_curve(y_test, y_scores)
+    rocauc_score = roc_auc_score(y_test, y_scores)
+    # Default Threshold
+    temp = 0.5 if label == 'probabilities' else 0
+    def_threshold_ind = np.argmin(np.abs(thresholds - temp))     # return index of aprox. default treshold value (for probability and score)
+    fpr_def_threshold = fpr[def_threshold_ind]
+    tpr_def_threshold = tpr[def_threshold_ind]
+    # Plot
+    plt.figure()
+    plt.title('ROC curve', fontsize=16)
+    plt.xlabel('False Positve Rate')
+    plt.ylabel('True Positive Rate')
+    plt.plot(fpr, tpr, lw=3, label='ROC curve with AUC score={:.2f}'.format(rocauc_score))
+    plt.plot([0,1], [0,1], lw=3, color='navy', linestyle='--', label='ROC of Random classifier', alpha=0.7)
+    plt.plot(fpr_def_threshold, tpr_def_threshold, marker='o', markersize=10, fillstyle='none', c='r', mew=3, alpha=0.8)
+    plt.legend(loc='lower right')
+    #plt.axes().set_aspect('equal')
+    plt.show()
+    plt.close()
+    return
 
+def plot_precision_recall_curve(y_test, y_scores, label='scores'):
+    """
+    PRECISION-RECALL CURVE
+        Tresholds are scores, for each treshold(selected score) we can calculate precision and recall value
+        We can plot all these scores thresholds values with Precision-Recall curve to observe precision and recall relationship for specific treshold.
+        Source: https://scikit-learn.org/stable/auto_examples/model_selection/plot_precision_recall.html
+    """
+    precision, recall, thresholds = precision_recall_curve(y_test, y_scores)
+    avg_precision = average_precision_score(y_test, y_scores)   # Average precision - summerize a curve
+    # Default Threshold
+    temp = 0.5 if label == 'probabilities' else 0               # by setting temp value you can manupilate with treshold and call make_predictions function
+    def_threshold_ind = np.argmin(np.abs(thresholds - temp))    # return index of aprox. default treshold value (for probability and score)
+    precision_def_threshold = precision[def_threshold_ind]
+    recall_def_threshold = recall[def_threshold_ind]
+    # Plot
+    plt.figure()
+    plt.title('Precision-Recall chart [{}]'.format(label), fontsize=16)
+    plt.xlabel('Precision')
+    plt.ylabel('Recall')
+    plt.plot(precision, recall, lw=3, label='PR Curve with AUC score or AP={:.2f}'.format(avg_precision))
+    plt.plot(precision_def_threshold, recall_def_threshold, marker='o', markersize=10, fillstyle='none', c='r', mew=3, alpha=0.8)
+    plt.legend(loc='lower right')
+    #plt.axes().set_aspect('equal')
+    plt.show()
+    plt.close()
+    return
+
+def plot_confusion_matrix(y_test, y_scores):
+    """
+    Plot confusion matrix as heatmap
+    """
+    index = ['Negative', 'Positive']
+    conf_matrix = confusion_matrix(y_test, y_scores)
+    df = pd.DataFrame(conf_matrix, index=index, columns=index)
+    plt.figure(figsize = (5.5, 4))
+    axes = sns.heatmap(df, annot=True, fmt='d', cmap='Blues')
+    axes.set_ylabel('Actual', fontsize=14)
+    axes.set_xlabel('Predicted', fontsize=14)
+    plt.show()
+    plt.close()
+    return
+
+def visualization_classification(y_test, y_preds):
+    """
+    Visualization of results of classification task 
+    """
+    plot_roc_curve(y_test, y_preds)
+
+    plot_precision_recall_curve(y_test, y_preds)
+
+    plot_confusion_matrix(y_test, y_preds)
+    return
+    
 
 if __name__ == "__main__":
 
-    predict_score(load_model=False, load_clean_data=True, sample=False, info=False)
+    load_model = False
 
-    sentiment_analysis(load_model=False, load_clean_data=True, sample=False, info=False)
+    predict_score(load_model=load_model, load_clean_data=True, sample=False, info=False)
+
+    sentiment_analysis(load_model=load_model, load_clean_data=True, sample=False, info=False)
     
 
